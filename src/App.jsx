@@ -65,6 +65,8 @@ const MAIN_COMPANY_MIN_COUNT = 8;
 const HISTORY_CONCURRENCY = 2;
 const SCHEDULE_SCAN_CONCURRENCY = 4;
 const SCHEDULE_RESULT_CONCURRENCY = 2;
+const PROXY_BATCH_ENDPOINT = "/proxy500/batch";
+const PROXY_BATCH_SIZE = 20;
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 const WEIGHT_MODE_OPTIONS = [
   { key: "hot", label: "Hot" },
@@ -1500,7 +1502,13 @@ async function hydrateFinishedFixtures(fixtures, scanTime, match, appendLog) {
   appendLog(`开始补全已完赛结果：${resultCandidates.length} 场。`);
 
   const resultMap = new Map();
-  const tasks = resultCandidates.map((fixture) => async () => {
+  const batchResults = await fetchFixtureResultsBatch(resultCandidates, match, appendLog);
+  batchResults.forEach((result, key) => {
+    if (result.isFinished) resultMap.set(key, result);
+  });
+
+  const remainingCandidates = resultCandidates.filter((fixture) => !resultMap.has(fixture.key));
+  const tasks = remainingCandidates.map((fixture) => async () => {
     const result = await fetchFixtureResult(fixture, match);
     if (result.isFinished) resultMap.set(fixture.key, result);
     return result;
@@ -1533,6 +1541,38 @@ async function fetchFixtureResult(fixture, match) {
     }
   }
   return { resultText: "", homeScore: null, awayScore: null, isFinished: false };
+}
+
+async function fetchFixtureResultsBatch(fixtures, match, appendLog) {
+  if (match.proxyPrefix) return new Map();
+
+  const requests = fixtures.flatMap((fixture) => buildFixtureResultUrls(fixture).map((url, index) => ({
+    id: `${fixture.key}::${index}`,
+    url,
+  })));
+  if (!requests.length) return new Map();
+
+  try {
+    const payload = await fetchProxyBatch(requests, { attempts: 2, concurrency: 2 });
+    const resultMap = new Map();
+
+    for (const item of payload.items || []) {
+      if (!item?.ok || !item.bodyBase64) continue;
+      const [fixtureKey] = String(item.id || "").split("::");
+      if (!fixtureKey || resultMap.has(fixtureKey)) continue;
+      const fixture = fixtures.find((candidate) => candidate.key === fixtureKey);
+      if (!fixture) continue;
+      const html = decodeBase64Text(item.bodyBase64, item.contentType);
+      const result = parseMatchResult(html, fixture, item.url);
+      if (result.isFinished) resultMap.set(fixtureKey, result);
+    }
+
+    if (resultMap.size) appendLog(`批量补全赛果：${resultMap.size}/${fixtures.length} 场。`);
+    return resultMap;
+  } catch (error) {
+    appendLog(`批量补全赛果失败，改用逐场补全：${error.message}`);
+    return new Map();
+  }
 }
 
 function buildFixtureResultUrls(fixture) {
@@ -1585,6 +1625,11 @@ async function loadAllBookmakers(config, initialCompanies, match, appendLog) {
 }
 
 async function loadHistoryRecords(config, companies, match, appendLog) {
+  if (!match.proxyPrefix) {
+    const batchRecords = await loadHistoryRecordsBatch(config, companies, match, appendLog);
+    if (batchRecords.length) return batchRecords;
+  }
+
   let completed = 0;
   const tasks = companies.map((company) => async () => {
     const records = await loadCompanyHistory(config, company, match, appendLog);
@@ -1596,6 +1641,57 @@ async function loadHistoryRecords(config, companies, match, appendLog) {
   });
   const chunks = await runLimited(tasks, HISTORY_CONCURRENCY);
   return chunks.flat();
+}
+
+async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
+  const requests = companies.flatMap((company) => ["europe", "kelly"].map((type) => ({
+    id: `${company.cid}::${type}`,
+    url: buildOddsHistoryUrl(config, company, type),
+  }))).filter((request) => request.url);
+
+  if (!requests.length) return [];
+
+  try {
+    appendLog(`线上批量拉取历史接口：${requests.length} 个请求。`);
+    const payload = await fetchProxyBatch(requests, { attempts: 3, concurrency: 2 });
+    const companyMap = new Map(companies.map((company) => [String(company.cid), company]));
+    const records = [];
+    const fetchedCompanyKeys = new Set();
+    const failedCompanyKeys = new Set();
+
+    for (const item of payload.items || []) {
+      const [cid, type] = String(item.id || "").split("::");
+      const company = companyMap.get(cid);
+      if (!company || !type) continue;
+      if (!item.ok || !item.bodyBase64) {
+        failedCompanyKeys.add(cid);
+        continue;
+      }
+
+      try {
+        const payloadText = decodeBase64Text(item.bodyBase64, item.contentType);
+        const parsed = parseOddsHistoryPayload(payloadText, company, type, match);
+        records.push(...parsed);
+        if (parsed.length) fetchedCompanyKeys.add(cid);
+      } catch {
+        failedCompanyKeys.add(cid);
+      }
+    }
+
+    appendLog(`批量历史完成：${fetchedCompanyKeys.size}/${companies.length} 家成功，${failedCompanyKeys.size} 家需要兜底。`);
+    if (fetchedCompanyKeys.size === 0) return [];
+
+    companies.forEach((company) => {
+      if (!fetchedCompanyKeys.has(String(company.cid))) {
+        records.push(...companySummaryRecords(company));
+      }
+    });
+
+    return records;
+  } catch (error) {
+    appendLog(`批量历史接口失败，改用逐家公司拉取：${error.message}`);
+    return [];
+  }
 }
 
 async function loadCompanyHistory(config, company, match, appendLog) {
@@ -1686,12 +1782,63 @@ async function fetchWithRetry(url, attempts = 4) {
   throw lastError || new Error("请求失败");
 }
 
+async function fetchProxyBatch(requests, options = {}) {
+  const chunks = chunkArray(requests, PROXY_BATCH_SIZE);
+  const items = [];
+
+  for (const chunk of chunks) {
+    const response = await fetch(PROXY_BATCH_ENDPOINT, {
+      method: "POST",
+      credentials: "omit",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        requests: chunk,
+        attempts: options.attempts,
+        concurrency: options.concurrency,
+      }),
+    });
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    items.push(...(payload.items || []));
+  }
+
+  return { items };
+}
+
+function decodeBase64Text(bodyBase64, contentType = "") {
+  const bytes = Uint8Array.from(atob(bodyBase64), (char) => char.charCodeAt(0));
+  const charset = contentType.match(/charset=([^;]+)/i)?.[1]?.trim();
+  const candidates = [charset, "gb18030", "gbk", "gb2312", "utf-8"].filter(Boolean);
+
+  for (const candidate of candidates) {
+    try {
+      return new TextDecoder(candidate).decode(bytes);
+    } catch {
+      // Try the next decoder.
+    }
+  }
+
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
 async function settle(promise) {
   try {
     return { status: "fulfilled", value: await promise };
   } catch (error) {
     return { status: "rejected", reason: error };
   }
+}
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function wait(ms) {

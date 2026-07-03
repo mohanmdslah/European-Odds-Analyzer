@@ -1,11 +1,14 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
-
-const TARGETS = {
-  live: "https://live.500.com",
-  odds: "https://odds.500.com",
-  liansai: "https://liansai.500.com",
-};
+import {
+  TARGETS,
+  buildUpstreamHeaders,
+  fetchProxyBatch,
+  fetchUpstream,
+  getProxyRequestFromUrl,
+  getUpstreamUrl,
+  isBatchProxyPath,
+} from "./proxy500.shared.js";
 
 export default defineConfig({
   plugins: [react(), proxy500Plugin()],
@@ -17,25 +20,33 @@ function proxy500Plugin() {
     configureServer(server) {
       server.middlewares.use("/proxy500", async (req, res) => {
         try {
-          const match = req.url.match(/^\/([^/?#]+)(.*)$/);
-          const target = match ? TARGETS[match[1]] : "";
+          const requestUrl = new URL(`/proxy500${req.url || ""}`, "http://localhost");
+          if (req.method === "OPTIONS") {
+            sendText(res, 204, "");
+            return;
+          }
+
+          if (req.method === "POST" && isBatchProxyPath(requestUrl.href)) {
+            sendJson(res, 200, await fetchProxyBatch(await readJsonBody(req)));
+            return;
+          }
+
+          if (!["GET", "HEAD"].includes(req.method)) {
+            sendText(res, 405, "Method not allowed.");
+            return;
+          }
+
+          const proxyRequest = getProxyRequestFromUrl(requestUrl.href);
+          const target = TARGETS[proxyRequest.targetKey];
           if (!target) {
             sendText(res, 400, "Unknown proxy target.");
             return;
           }
 
-          const upstreamUrl = `${target}${match[2] || "/"}`;
-          const isAjax = /\/fenxi1\//.test(match[2] || "");
-          const isJson = /\/fenxi1\/json\//.test(match[2] || "");
-          const headers = {
-            "User-Agent":
-              "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
-            Referer: target,
-            Accept: isJson ? "application/json, text/javascript, */*; q=0.01" : "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          };
-          if (isAjax) headers["X-Requested-With"] = "XMLHttpRequest";
-
-          const upstream = await fetchUpstream(upstreamUrl, headers);
+          const upstream = await fetchUpstream(
+            getUpstreamUrl(proxyRequest),
+            buildUpstreamHeaders(target, proxyRequest.path, proxyRequest.search),
+          );
 
           const buffer = Buffer.from(await upstream.arrayBuffer());
           res.statusCode = upstream.status;
@@ -50,32 +61,23 @@ function proxy500Plugin() {
   };
 }
 
-async function fetchUpstream(url, headers, attempts = 3) {
-  let lastResponse;
-  let lastError;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      const response = await fetch(url, {
-        redirect: "follow",
-        headers,
-      });
-      if (![429, 500, 502, 503, 504].includes(response.status)) return response;
-      lastResponse = response;
-    } catch (error) {
-      lastError = error;
-    }
-
-    if (attempt < attempts - 1) {
-      await new Promise((resolve) => setTimeout(resolve, 350 * 2 ** attempt));
-    }
-  }
-
-  if (lastResponse) return lastResponse;
-  throw lastError || new Error("Upstream request failed.");
-}
-
 function sendText(res, statusCode, message) {
   res.statusCode = statusCode;
+  res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Content-Type", "text/plain; charset=utf-8");
   res.end(message);
+}
+
+function sendJson(res, statusCode, payload) {
+  res.statusCode = statusCode;
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(payload));
+}
+
+async function readJsonBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  const body = Buffer.concat(chunks).toString("utf8");
+  return body ? JSON.parse(body) : {};
 }
