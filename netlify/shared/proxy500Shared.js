@@ -49,6 +49,7 @@ export function getUpstreamUrl(proxyRequest) {
 export function buildUpstreamHeaders(target, path, search = "") {
   const isAjax = /\/fenxi1\//.test(path);
   const isJson = /\/fenxi1\/json\//.test(path);
+  const targetHost = new URL(target).hostname;
   const referer = buildReferer(target, path, search);
   const headers = {
     "User-Agent":
@@ -62,6 +63,13 @@ export function buildUpstreamHeaders(target, path, search = "") {
     "Sec-Fetch-Mode": isAjax ? "cors" : "navigate",
     "Sec-Fetch-Dest": isAjax ? "empty" : "document",
   };
+
+  if (targetHost === "live.500.com") {
+    headers.Accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+    headers.Referer = "https://live.500.com/";
+    headers["Cache-Control"] = "no-cache";
+    headers.Pragma = "no-cache";
+  }
 
   if (isAjax) headers["X-Requested-With"] = "XMLHttpRequest";
   return headers;
