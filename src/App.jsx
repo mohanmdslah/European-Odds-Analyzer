@@ -63,6 +63,7 @@ const emptyBettingAnalysis = {
 };
 const MAIN_COMPANY_MIN_COUNT = 8;
 const HISTORY_CONCURRENCY = 2;
+const HISTORY_FALLBACK_DELAY_MS = 360;
 const SCHEDULE_SCAN_CONCURRENCY = 4;
 const SCHEDULE_RESULT_CONCURRENCY = 2;
 const PROXY_BATCH_ENDPOINT = "/proxy500/batch";
@@ -1625,7 +1626,7 @@ async function loadAllBookmakers(config, initialCompanies, match, appendLog) {
 }
 
 async function loadHistoryRecords(config, companies, match, appendLog) {
-  if (!match.proxyPrefix) {
+  if (!match.proxyPrefix && shouldUseBatchHistoryProxy()) {
     const batchRecords = await loadHistoryRecordsBatch(config, companies, match, appendLog);
     if (batchRecords.length) return batchRecords;
   }
@@ -1637,10 +1638,15 @@ async function loadHistoryRecords(config, companies, match, appendLog) {
     if (completed % 10 === 0 || completed === companies.length) {
       appendLog(`历史接口进度：${completed}/${companies.length} 家。`);
     }
+    if (!match.proxyPrefix) await wait(HISTORY_FALLBACK_DELAY_MS);
     return records;
   });
   const chunks = await runLimited(tasks, HISTORY_CONCURRENCY);
   return chunks.flat();
+}
+
+function shouldUseBatchHistoryProxy() {
+  return false;
 }
 
 async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
@@ -1658,27 +1664,43 @@ async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
     const records = [];
     const fetchedCompanyKeys = new Set();
     const failedCompanyKeys = new Set();
+    const statusCounts = new Map();
+    const failureSamples = [];
 
     for (const item of payload.items || []) {
       const [cid, type] = String(item.id || "").split("::");
       const company = companyMap.get(cid);
       if (!company || !type) continue;
+      const statusKey = `${item.status || 0}`;
+      statusCounts.set(statusKey, (statusCounts.get(statusKey) || 0) + 1);
       if (!item.ok || !item.bodyBase64) {
         failedCompanyKeys.add(cid);
+        if (failureSamples.length < 3) {
+          failureSamples.push(formatBatchFailure(item, company, type));
+        }
         continue;
       }
 
       try {
         const payloadText = decodeBase64Text(item.bodyBase64, item.contentType);
         const parsed = parseOddsHistoryPayload(payloadText, company, type, match);
+        if (!parsed.length && failureSamples.length < 3) {
+          failureSamples.push(`${company.bookmaker} ${type} 返回空数据，状态 ${item.status}，内容：${summarizeText(payloadText) || item.preview || "空"}`);
+        }
         records.push(...parsed);
         if (parsed.length) fetchedCompanyKeys.add(cid);
-      } catch {
+      } catch (error) {
         failedCompanyKeys.add(cid);
+        if (failureSamples.length < 3) {
+          const payloadText = decodeBase64Text(item.bodyBase64, item.contentType);
+          failureSamples.push(`${company.bookmaker} ${type} 解析失败：${error.message}；内容：${summarizeText(payloadText) || item.preview || "空"}`);
+        }
       }
     }
 
-    appendLog(`批量历史完成：${fetchedCompanyKeys.size}/${companies.length} 家成功，${failedCompanyKeys.size} 家需要兜底。`);
+    const statusSummary = [...statusCounts.entries()].map(([status, count]) => `${status}:${count}`).join("，") || "无响应";
+    appendLog(`批量历史完成：${fetchedCompanyKeys.size}/${companies.length} 家成功，${failedCompanyKeys.size} 家需要兜底，状态分布 ${statusSummary}。`);
+    failureSamples.forEach((sample) => appendLog(`批量失败样例：${sample}`));
     if (fetchedCompanyKeys.size === 0) return [];
 
     companies.forEach((company) => {
@@ -1696,7 +1718,7 @@ async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
 
 async function loadCompanyHistory(config, company, match, appendLog) {
   const euroResult = await settle(fetchHistoryType(config, company, "europe", match));
-  await wait(140);
+  await wait(match.proxyPrefix ? 140 : HISTORY_FALLBACK_DELAY_MS);
   const kellyResult = await settle(fetchHistoryType(config, company, "kelly", match));
 
   const records = [
@@ -1705,7 +1727,7 @@ async function loadCompanyHistory(config, company, match, appendLog) {
   ];
 
   if (!records.length) {
-    appendLog(`${company.bookmaker}(${company.cid}) 历史为空或读取失败。`);
+    appendLog(`${company.bookmaker}(${company.cid}) 历史为空或读取失败：${formatSettledError(euroResult, "欧赔")} ${formatSettledError(kellyResult, "凯利")}`.trim());
     return companySummaryRecords(company);
   }
   return records;
@@ -1823,6 +1845,25 @@ function decodeBase64Text(bodyBase64, contentType = "") {
   }
 
   return new TextDecoder("utf-8").decode(bytes);
+}
+
+function formatBatchFailure(item, company, type) {
+  const preview = item.bodyBase64 ? summarizeText(decodeBase64Text(item.bodyBase64, item.contentType)) : "";
+  return `${company.bookmaker} ${type} 状态 ${item.status || 0}，${item.error || preview || item.preview || "无响应内容"}`;
+}
+
+function formatSettledError(result, label) {
+  if (result.status === "fulfilled" && result.value?.length) return `${label}成功`;
+  if (result.status === "fulfilled") return `${label}空`;
+  return `${label}${result.reason?.message || "失败"}`;
+}
+
+function summarizeText(value) {
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
 }
 
 async function throwHttpError(response) {

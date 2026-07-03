@@ -17,6 +17,12 @@
   status = 200
 
 [[redirects]]
+  from = "/proxy500/odds/fenxi1/json/*"
+  to = "https://odds.500.com/fenxi1/json/:splat"
+  status = 200
+  headers = {User-Agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36", Referer = "https://odds.500.com/", Accept = "application/json, text/javascript, */*; q=0.01", Accept-Language = "zh-CN,zh;q=0.9,en;q=0.8"}
+
+[[redirects]]
   from = "/proxy500/odds/fenxi1/*"
   to = "/.netlify/functions/proxy500/odds/fenxi1/:splat"
   status = 200

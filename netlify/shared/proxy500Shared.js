@@ -128,14 +128,16 @@ async function fetchProxyBatchItem(request, attempts, cookieJar) {
       { attempts, cookieJar },
     );
     const buffer = Buffer.from(await upstream.arrayBuffer());
+    const contentType = upstream.headers.get("content-type") || "text/html; charset=gb18030";
 
     return {
       id,
       url: sourceUrl,
       status: upstream.status,
       ok: upstream.ok,
-      contentType: upstream.headers.get("content-type") || "text/html; charset=gb18030",
+      contentType,
       bodyBase64: buffer.toString("base64"),
+      preview: buffer.toString("utf8", 0, Math.min(buffer.length, 180)).replace(/\s+/g, " ").trim(),
       error: "",
     };
   } catch (error) {
