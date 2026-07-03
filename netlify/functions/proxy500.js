@@ -6,7 +6,7 @@ import {
   getProxyRequestFromUrl,
   getUpstreamUrl,
   isBatchProxyPath,
-} from "../../proxy500.shared.js";
+} from "../shared/proxy500Shared.js";
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -14,28 +14,40 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "Content-Type, X-Requested-With",
 };
 
-export default async function proxy500(request) {
-  if (request.method === "OPTIONS") {
-    return new Response(null, {
-      status: 204,
-      headers: CORS_HEADERS,
+export async function handler(event) {
+  const method = event.httpMethod || "GET";
+  const requestUrl = getEventUrl(event);
+
+  if (method === "GET" && requestUrl.pathname.endsWith("/_health")) {
+    return jsonResponse(200, {
+      ok: true,
+      runtime: "netlify-functions",
+      path: requestUrl.pathname,
     });
   }
 
-  if (request.method === "POST" && isBatchProxyPath(request.url)) {
+  if (method === "OPTIONS") {
+    return {
+      statusCode: 204,
+      headers: CORS_HEADERS,
+      body: "",
+    };
+  }
+
+  if (method === "POST" && isBatchProxyPath(requestUrl.href)) {
     try {
-      return jsonResponse(200, await fetchProxyBatch(await request.json()));
+      return jsonResponse(200, await fetchProxyBatch(readJsonBody(event)));
     } catch (error) {
       return textResponse(400, `Invalid batch request: ${error.message}`);
     }
   }
 
-  if (!["GET", "HEAD"].includes(request.method)) {
+  if (!["GET", "HEAD"].includes(method)) {
     return textResponse(405, "Method not allowed.");
   }
 
   try {
-    const proxyRequest = getProxyRequestFromUrl(request.url);
+    const proxyRequest = getProxyRequestFromUrl(requestUrl.href);
     const target = TARGETS[proxyRequest.targetKey];
     if (!target) return textResponse(400, "Unknown proxy target.");
 
@@ -43,39 +55,61 @@ export default async function proxy500(request) {
       getUpstreamUrl(proxyRequest),
       buildUpstreamHeaders(target, proxyRequest.path, proxyRequest.search),
     );
-    const isHead = request.method === "HEAD";
+    const buffer = Buffer.from(await upstream.arrayBuffer());
+    const isHead = method === "HEAD";
 
-    return new Response(isHead ? null : upstream.body, {
-      status: upstream.status,
+    return {
+      statusCode: upstream.status,
       headers: {
         ...CORS_HEADERS,
         "Cache-Control": "no-store",
         "Content-Type": upstream.headers.get("content-type") || "text/html; charset=gb18030",
       },
-    });
+      isBase64Encoded: !isHead,
+      body: isHead ? "" : buffer.toString("base64"),
+    };
   } catch (error) {
     return textResponse(502, `Proxy request failed: ${error.message}`);
   }
 }
 
+function getEventUrl(event) {
+  if (event.rawUrl) return new URL(event.rawUrl);
+
+  const host = event.headers?.host || event.headers?.Host || "localhost";
+  const rawQuery = event.rawQuery
+    || (event.queryStringParameters ? new URLSearchParams(event.queryStringParameters).toString() : "");
+  const query = rawQuery ? `?${rawQuery}` : "";
+  return new URL(`https://${host}${event.path || ""}${query}`);
+}
+
+function readJsonBody(event) {
+  const body = event.isBase64Encoded
+    ? Buffer.from(event.body || "", "base64").toString("utf8")
+    : event.body || "{}";
+  return JSON.parse(body || "{}");
+}
+
 function textResponse(statusCode, message) {
-  return new Response(message, {
-    status: statusCode,
+  return {
+    statusCode,
     headers: {
       ...CORS_HEADERS,
       "Cache-Control": "no-store",
       "Content-Type": "text/plain; charset=utf-8",
     },
-  });
+    body: message,
+  };
 }
 
 function jsonResponse(statusCode, payload) {
-  return new Response(JSON.stringify(payload), {
-    status: statusCode,
+  return {
+    statusCode,
     headers: {
       ...CORS_HEADERS,
       "Cache-Control": "no-store",
       "Content-Type": "application/json; charset=utf-8",
     },
-  });
+    body: JSON.stringify(payload),
+  };
 }

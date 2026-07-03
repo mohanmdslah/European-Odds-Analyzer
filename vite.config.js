@@ -8,7 +8,7 @@ import {
   getProxyRequestFromUrl,
   getUpstreamUrl,
   isBatchProxyPath,
-} from "./proxy500.shared.js";
+} from "./netlify/shared/proxy500Shared.js";
 
 export default defineConfig({
   plugins: [react(), proxy500Plugin()],

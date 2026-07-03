@@ -7,6 +7,11 @@
   NODE_VERSION = "20"
 
 [[redirects]]
+  from = "/proxy500/_health"
+  to = "/.netlify/functions/proxy500/_health"
+  status = 200
+
+[[redirects]]
   from = "/proxy500/batch"
   to = "/.netlify/functions/proxy500/batch"
   status = 200
