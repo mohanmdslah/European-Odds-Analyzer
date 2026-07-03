@@ -346,7 +346,7 @@ export default function App() {
     const requestUrl = buildRequestUrl(directUrl, targetMatch.proxyPrefix);
     appendLog(`读取欧赔页：${requestUrl}`);
     const response = await fetch(requestUrl, { credentials: "omit", cache: "no-store" });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) await throwHttpError(response);
 
     const html = await decodeResponse(response);
     appendLog(`已获取页面，长度 ${html.length.toLocaleString("zh-CN")} 字符。`);
@@ -1755,7 +1755,7 @@ async function fetchHistoryType(config, company, type, match) {
   if (!url) return [];
   const requestUrl = buildRequestUrl(url, match.proxyPrefix);
   const response = await fetchWithRetry(requestUrl);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  if (!response.ok) await throwHttpError(response);
   const payload = await decodeResponse(response);
   return parseOddsHistoryPayload(payload, company, type, match);
 }
@@ -1801,7 +1801,7 @@ async function fetchProxyBatch(requests, options = {}) {
       }),
     });
 
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    if (!response.ok) await throwHttpError(response);
     const payload = await response.json();
     items.push(...(payload.items || []));
   }
@@ -1823,6 +1823,22 @@ function decodeBase64Text(bodyBase64, contentType = "") {
   }
 
   return new TextDecoder("utf-8").decode(bytes);
+}
+
+async function throwHttpError(response) {
+  let detail = "";
+  try {
+    detail = await decodeResponse(response);
+  } catch {
+    detail = "";
+  }
+
+  const message = detail
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+  throw new Error(message ? `HTTP ${response.status}：${message}` : `HTTP ${response.status}`);
 }
 
 async function settle(promise) {
