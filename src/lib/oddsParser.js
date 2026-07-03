@@ -398,7 +398,6 @@ export function applyProxy(url, prefix) {
 
 export function buildRequestUrl(url, proxyPrefix = "") {
   if (proxyPrefix) return applyProxy(url, proxyPrefix);
-  if (!isLocalDev()) return url;
 
   try {
     const parsed = new URL(url);
@@ -2341,10 +2340,6 @@ function toDateOnly(date) {
 
 function pad(value) {
   return String(value).padStart(2, "0");
-}
-
-function isLocalDev() {
-  return ["localhost", "127.0.0.1"].includes(window.location.hostname);
 }
 
 function getProxyTargetKey(hostname) {
