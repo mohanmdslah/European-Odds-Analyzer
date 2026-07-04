@@ -210,6 +210,32 @@ export function buildBettingAnalysisUrls(config) {
   ];
 }
 
+export function buildAsianOddsUrls(config) {
+  if (!config?.fixtureId) return [];
+  return [
+    `https://odds.500.com/fenxi/yazhi-${config.fixtureId}.shtml`,
+    `https://odds.500.com/fenxi1/yazhi.php?id=${config.fixtureId}`,
+    `https://odds.500.com/fenxi1/json/yazhi.php?fid=${config.fixtureId}`,
+  ];
+}
+
+export function buildTotalOddsUrls(config) {
+  if (!config?.fixtureId) return [];
+  return [
+    `https://odds.500.com/fenxi/daxiao-${config.fixtureId}.shtml`,
+    `https://odds.500.com/fenxi1/daxiao.php?id=${config.fixtureId}`,
+    `https://odds.500.com/fenxi1/json/daxiao.php?fid=${config.fixtureId}`,
+  ];
+}
+
+export function parseAsianOddsPayload(payload, match = {}, sourceUrl = "") {
+  return parseTwoWayMarketPayload(payload, match, sourceUrl, "asian");
+}
+
+export function parseTotalOddsPayload(payload, match = {}, sourceUrl = "") {
+  return parseTwoWayMarketPayload(payload, match, sourceUrl, "totals");
+}
+
 export function parseBettingAnalysisPayload(payload, match = {}, sourceUrl = "") {
   const normalized = normalizeHtmlText(payload);
   const scriptData = parseBettingScriptData(normalized, match, sourceUrl);
@@ -685,6 +711,196 @@ function parseBettingAnalysisJson(data, match, sourceUrl) {
     largeDetails,
     summaryText: extractBettingSummaryText(nodes.map((node) => node.text).join(" ")),
   };
+}
+
+function parseTwoWayMarketPayload(payload, match, sourceUrl, marketType) {
+  const normalized = normalizeHtmlText(payload);
+  const jsonData = parseJsonPayload(normalized);
+  const jsonRecords = jsonData ? parseTwoWayMarketJson(jsonData, match, sourceUrl, marketType) : [];
+  const docRecords = parseTwoWayMarketHtml(normalized, match, sourceUrl, marketType);
+  const records = mergeMarketRecords([...jsonRecords, ...docRecords], marketType);
+  const latest = records.slice().reverse().find((record) => Number.isFinite(record.line)) || null;
+  const opening = records.find((record) => Number.isFinite(record.line)) || null;
+
+  return {
+    sourceUrl,
+    type: marketType,
+    opening,
+    latest,
+    records,
+    companies: summarizeTwoWayMarketCompanies(records),
+  };
+}
+
+function parseTwoWayMarketJson(data, match, sourceUrl, marketType) {
+  return flattenJsonNodes(data)
+    .flatMap((node) => {
+      if (Array.isArray(node.value)) return parseTwoWayMarketArray(node.value, match, sourceUrl, marketType);
+      if (node.value && typeof node.value === "object") return parseTwoWayMarketObject(node.value, match, sourceUrl, marketType);
+      return [];
+    })
+    .filter(Boolean);
+}
+
+function parseTwoWayMarketArray(value, match, sourceUrl, marketType) {
+  const cells = value.map((item) => cleanText(item));
+  if (cells.filter(Boolean).length < 3) return [];
+  const record = buildTwoWayMarketRecord(cells, match, sourceUrl, marketType);
+  return record ? [record] : [];
+}
+
+function parseTwoWayMarketObject(value, match, sourceUrl, marketType) {
+  const cells = Object.entries(value).map(([key, item]) => `${key}:${cleanText(item)}`);
+  const record = buildTwoWayMarketRecord(cells, match, sourceUrl, marketType);
+  return record ? [record] : [];
+}
+
+function parseTwoWayMarketHtml(payload, match, sourceUrl, marketType) {
+  const doc = parseHtmlDocument(payload);
+  return [...doc.querySelectorAll("tr")]
+    .map((row) => buildTwoWayMarketRecord(getRowCells(row), match, sourceUrl, marketType))
+    .filter(Boolean);
+}
+
+function buildTwoWayMarketRecord(cells, match, sourceUrl, marketType) {
+  const rowText = cleanText(cells.join(" "));
+  if (!rowText || /公司筛选|选择公司|主流公司|赔率公司/.test(rowText)) return null;
+  const numbers = cells.map(parseNumber).filter(Number.isFinite);
+  if (numbers.length < 3) return null;
+
+  const line = pickMarketLine(cells, numbers, marketType);
+  if (!Number.isFinite(line)) return null;
+
+  const waters = pickWaterValues(numbers, line, marketType);
+  if (!waters) return null;
+
+  const bookmaker = inferMarketBookmaker(cells, rowText);
+  const time = cells.map(extractTime).find(Boolean) || normalizeTimeString(match?.kickoffTime ? "" : "");
+  const isOpening = /初盘|开盘|初赔/.test(rowText);
+  const isLatest = /即时|最新|终盘|临场/.test(rowText);
+
+  return {
+    type: marketType,
+    sourceUrl,
+    bookmaker,
+    time,
+    line,
+    homeWater: marketType === "asian" ? waters.primary : null,
+    awayWater: marketType === "asian" ? waters.secondary : null,
+    overWater: marketType === "totals" ? waters.primary : null,
+    underWater: marketType === "totals" ? waters.secondary : null,
+    isOpening,
+    isLatest,
+    raw: rowText.slice(0, 240),
+  };
+}
+
+function pickMarketLine(cells, numbers, marketType) {
+  const joined = cleanText(cells.join(" "));
+  const labelLine = parseChineseMarketLine(joined, marketType);
+  if (Number.isFinite(labelLine)) return labelLine;
+
+  const candidates = numbers.filter((value) => {
+    if (marketType === "asian") return value >= -4 && value <= 4 && Math.abs(value) % 0.25 < 0.001;
+    return value >= 0.5 && value <= 6.5 && Math.abs(value * 4 - Math.round(value * 4)) < 0.001;
+  });
+  if (!candidates.length) return null;
+
+  if (marketType === "asian") {
+    const candidate = candidates.find((value) => Math.abs(value) <= 3 && Math.abs(value) >= 0.25) ?? candidates[0];
+    return applyAsianLineDirection(candidate, joined);
+  }
+  return candidates.find((value) => value >= 1.5 && value <= 4.5) ?? candidates[0];
+}
+
+function pickWaterValues(numbers, line, marketType) {
+  const waterCandidates = numbers.filter((value) => {
+    if (value === line) return false;
+    if (marketType === "totals" && value > 1.6 && value <= 4.8) return false;
+    return value >= 0.5 && value <= 1.5;
+  });
+  if (waterCandidates.length < 2) return null;
+  return {
+    primary: waterCandidates[0],
+    secondary: waterCandidates[1],
+  };
+}
+
+function parseChineseMarketLine(text, marketType) {
+  const normalized = cleanText(text);
+  const numeric = normalized.match(/(?:让球|盘口|大小|球数|line)[:：\s]*([+-]?\d+(?:\.\d+)?)/i)?.[1];
+  if (numeric) {
+    const value = Number.parseFloat(numeric);
+    return marketType === "asian" ? applyAsianLineDirection(value, normalized) : value;
+  }
+
+  if (marketType === "asian") {
+    const value = parseChineseHandicapName(normalized);
+    return Number.isFinite(value) ? applyAsianLineDirection(value, normalized) : null;
+  }
+
+  const total = normalized.match(/(?:大|小)\s*([0-6](?:\.[02575]+)?)/)?.[1];
+  return total ? Number.parseFloat(total) : null;
+}
+
+function applyAsianLineDirection(value, text) {
+  if (!Number.isFinite(value) || value === 0) return value;
+  if (/客让|客队让|让球客|下盘让|主受|主队受|受让|受平|受半|受一|受球|受两|受二/.test(text)) return Math.abs(value);
+  if (/主让|主队让|让球主|上盘让/.test(text)) return -Math.abs(value);
+  if (value < 0) return value;
+  return -Math.abs(value);
+}
+
+function parseChineseHandicapName(text) {
+  if (/平手\/半球|平\/半/.test(text)) return 0.25;
+  if (/半球\/一球|半\/一/.test(text)) return 0.75;
+  if (/一球\/球半|一\/球半/.test(text)) return 1.25;
+  if (/球半\/两球|球半\/二/.test(text)) return 1.75;
+  if (/两球\/两球半|二球\/二球半/.test(text)) return 2.25;
+  if (/平手/.test(text)) return 0;
+  if (/半球/.test(text)) return 0.5;
+  if (/一球|1球/.test(text)) return 1;
+  if (/球半/.test(text)) return 1.5;
+  if (/两球|二球|2球/.test(text)) return 2;
+  return null;
+}
+
+function inferMarketBookmaker(cells, rowText) {
+  const known = KNOWN_BOOKMAKER_WORDS.find((word) => rowText.includes(word));
+  if (known) return known;
+  return cells.find((cell) => !looksNumeric(cell) && !extractTime(cell) && cell.length <= 24 && !/盘口|水位|即时|初盘|变化/.test(cell)) || "市场均值";
+}
+
+function mergeMarketRecords(records, marketType) {
+  const seen = new Set();
+  return records
+    .filter((record) => record?.type === marketType && Number.isFinite(record.line))
+    .filter((record) => {
+      const key = `${record.bookmaker}|${record.time}|${record.line}|${record.homeWater ?? record.overWater}|${record.awayWater ?? record.underWater}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((a, b) => {
+      if (a.isOpening !== b.isOpening) return a.isOpening ? -1 : 1;
+      if (a.isLatest !== b.isLatest) return a.isLatest ? 1 : -1;
+      return parseTimeToMs(a.time, null) - parseTimeToMs(b.time, null);
+    });
+}
+
+function summarizeTwoWayMarketCompanies(records) {
+  const groups = new Map();
+  records.forEach((record) => {
+    const key = record.bookmaker || "市场均值";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(record);
+  });
+  return [...groups.entries()].map(([bookmaker, rows]) => ({
+    bookmaker,
+    opening: rows.find((row) => row.isOpening) || rows[0],
+    latest: rows.slice().reverse().find((row) => row.isLatest) || rows.at(-1),
+    count: rows.length,
+  }));
 }
 
 function parseBettingScriptData(payload, match, sourceUrl) {

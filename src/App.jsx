@@ -19,6 +19,7 @@ import {
 import { SAMPLE_ODDS_HTML } from "./data/sampleData";
 import {
   buildScheduleScanUrls,
+  buildAsianOddsUrls,
   buildBettingAnalysisUrls,
   buildMoreBookmakersUrl,
   buildOddsUrl,
@@ -26,6 +27,7 @@ import {
   buildRequestUrl,
   buildWeightedOddsTimeline,
   buildScheduleUrls,
+  buildTotalOddsUrls,
   buildOddsResult,
   decodeResponse,
   extractScheduleScanUrls,
@@ -38,13 +40,17 @@ import {
   parseBookmakerRows,
   parseFixtureConfig,
   parseScheduleFixtures,
+  parseAsianOddsPayload,
   parseBettingAnalysisPayload,
   parseMatchInfo,
   parseMatchResult,
   parseOddsHistoryPayload,
   parseOddsPayload,
+  parseTotalOddsPayload,
   toDatetimeLocal,
 } from "./lib/oddsParser";
+import { QuantDashboard } from "./components/QuantDashboard";
+import { buildQuantEngine } from "./lib/quantEngine";
 import "./styles.css";
 
 const emptyResult = { records: [], bookmakers: [], match: null, weightMode: "" };
@@ -60,6 +66,10 @@ const emptyBettingAnalysis = {
   },
   largeDetails: [],
   summaryText: "",
+};
+const emptyMarketData = {
+  asian: emptyMarket("asian"),
+  totals: emptyMarket("totals"),
 };
 const MAIN_COMPANY_MIN_COUNT = 8;
 const HISTORY_CONCURRENCY = 2;
@@ -98,6 +108,7 @@ export default function App() {
   });
   const [result, setResult] = useState(emptyResult);
   const [bettingAnalysis, setBettingAnalysis] = useState(emptyBettingAnalysis);
+  const [marketData, setMarketData] = useState(emptyMarketData);
   const [scheduleFixtures, setScheduleFixtures] = useState([]);
   const [logs, setLogs] = useState([
     logLine("页面已加载。可输入比赛 ID/URL 采集，也可扫描前 7 天至后 7 天单场比分赛程。"),
@@ -130,7 +141,17 @@ export default function App() {
     ? getWeightModeLabel(displayResult.weightMode || displayResult.match?.weightMode)
     : "--";
   const displayMatch = displayResult.match || match;
-  const heroMetrics = useMemo(() => buildHeroMetrics(displayResult), [displayResult]);
+  const heroMetrics = useMemo(() => buildHeroMetrics(displayResult, bettingAnalysis), [displayResult, bettingAnalysis]);
+  const quantEngine = useMemo(
+    () => buildQuantEngine({
+      match: displayMatch,
+      records: displayResult.records,
+      bookmakers: displayResult.bookmakers,
+      bettingAnalysis,
+      markets: marketData,
+    }),
+    [displayMatch, displayResult.records, displayResult.bookmakers, bettingAnalysis, marketData]
+  );
   const firstRecord = displayResult.records[0];
   const lastRecord = displayResult.records[displayResult.records.length - 1];
   const canExport = displayResult.records.length > 0;
@@ -194,6 +215,7 @@ export default function App() {
   function resetResult() {
     setResult(emptyResult);
     setBettingAnalysis(emptyBettingAnalysis);
+    setMarketData(emptyMarketData);
     setExpandedBookmakers(new Set());
   }
 
@@ -377,7 +399,7 @@ export default function App() {
     const historyRecords = await loadHistoryRecords(config, mainCompanies, resolvedMatch, appendLog);
     const parsed = withResultMeta(buildOddsResult(historyRecords, resolvedMatch), resolvedMatch);
     setResult(parsed);
-    await loadBettingAnalysis(config, resolvedMatch);
+    await loadSupplementalData(config, resolvedMatch);
 
     if (parsed.records.length === 0) {
       setStatus("warn");
@@ -386,6 +408,18 @@ export default function App() {
       setStatus("ok");
       appendLog(`采集完成：${parsed.bookmakers.length} 家公司，${parsed.records.length} 条完整变化记录。`);
     }
+  }
+
+  async function loadSupplementalData(config, resolvedMatch) {
+    const tasks = [
+      loadBettingAnalysis(config, resolvedMatch),
+      loadOptionalMarketData(config, resolvedMatch),
+    ];
+    const results = await Promise.allSettled(tasks);
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") return;
+      appendLog(`${index === 0 ? "投注分析" : "盘口增强"}读取异常：${result.reason?.message || "未知错误"}。主欧赔结果已保留。`);
+    });
   }
 
   function parseOddsHtmlFallback(payload, sourceLabel, overrideMatch = match) {
@@ -441,6 +475,42 @@ export default function App() {
     }
   }
 
+  async function loadOptionalMarketData(config, targetMatch) {
+    const [asian, totals] = await Promise.all([
+      loadMarketType(buildAsianOddsUrls(config), targetMatch, parseAsianOddsPayload, "亚盘"),
+      loadMarketType(buildTotalOddsUrls(config), targetMatch, parseTotalOddsPayload, "大小球"),
+    ]);
+    setMarketData({ asian, totals });
+  }
+
+  async function loadMarketType(urls, targetMatch, parser, label) {
+    if (!urls.length) return emptyMarket(label);
+
+    for (const url of urls) {
+      const requestUrl = buildRequestUrl(url, targetMatch.proxyPrefix);
+      try {
+        appendLog(`读取${label}：${requestUrl}`);
+        const response = await fetch(requestUrl, { credentials: "omit", cache: "no-store" });
+        if (!response.ok) {
+          appendLog(`${label}返回 HTTP ${response.status}，继续尝试下一个。`);
+          continue;
+        }
+        const payload = await decodeResponse(response);
+        const parsed = parser(payload, targetMatch, url);
+        if (parsed.records.length) {
+          appendLog(`${label}数据已更新：${parsed.companies.length} 家公司，${parsed.records.length} 条记录。`);
+          return parsed;
+        }
+        appendLog(`${label}页面未识别到结构化盘口，继续尝试下一个。`);
+      } catch (error) {
+        appendLog(`${label}读取失败：${error.message}`);
+      }
+    }
+
+    appendLog(`${label}暂无可用公开盘口，量化引擎将使用欧赔理论映射。`);
+    return emptyMarket(label);
+  }
+
   function exportCsv() {
     const headers = ["时间", "公司ID", "是否主流", "公司", "胜", "平", "负", "返还率", "凯利胜", "凯利平", "凯利负", "类型"];
     const rows = displayResult.records.map((record) => [
@@ -466,6 +536,8 @@ export default function App() {
       match,
       records: displayResult.records,
       bookmakers: displayResult.bookmakers,
+      markets: marketData,
+      quantEngine,
       exportedAt: new Date().toISOString(),
     };
     downloadBlob(JSON.stringify(payload, null, 2), `${filenameBase(match)}.json`, "application/json;charset=utf-8");
@@ -780,6 +852,7 @@ export default function App() {
           <div className="tabs">
             {[
               ["bookmakers", "公司汇总"],
+              ["quant", "量化引擎"],
               ["betting", "投注分析"],
               ["log", "采集日志"],
             ].map(([key, label]) => (
@@ -803,8 +876,9 @@ export default function App() {
               onToggle={toggleBookmaker}
             />
           )}
+          {activeTab === "quant" && <QuantDashboard engine={quantEngine} />}
           {activeTab === "betting" && <BettingAnalysisPanel analysis={bettingAnalysis} match={displayMatch} />}
-          {activeTab === "log" && <pre className="log-panel">{logs.join("\n")}</pre>}
+          {activeTab === "log" && <pre className="log-panel">{logs.slice().reverse().join("\n")}</pre>}
         </motion.section>
       </motion.section>
     </motion.main>
@@ -1201,6 +1275,17 @@ function withResultMeta(result, match) {
     ...result,
     match,
     weightMode: match?.weightMode || "hot",
+  };
+}
+
+function emptyMarket(type = "") {
+  return {
+    sourceUrl: "",
+    type,
+    opening: null,
+    latest: null,
+    records: [],
+    companies: [],
   };
 }
 
@@ -1646,7 +1731,7 @@ async function loadHistoryRecords(config, companies, match, appendLog) {
 }
 
 function shouldUseBatchHistoryProxy() {
-  return false;
+  return true;
 }
 
 async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
@@ -1674,7 +1759,7 @@ async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
       const statusKey = `${item.status || 0}`;
       statusCounts.set(statusKey, (statusCounts.get(statusKey) || 0) + 1);
       if (!item.ok || !item.bodyBase64) {
-        failedCompanyKeys.add(cid);
+        if (!fetchedCompanyKeys.has(cid)) failedCompanyKeys.add(cid);
         if (failureSamples.length < 3) {
           failureSamples.push(formatBatchFailure(item, company, type));
         }
@@ -1688,9 +1773,12 @@ async function loadHistoryRecordsBatch(config, companies, match, appendLog) {
           failureSamples.push(`${company.bookmaker} ${type} 返回空数据，状态 ${item.status}，内容：${summarizeText(payloadText) || item.preview || "空"}`);
         }
         records.push(...parsed);
-        if (parsed.length) fetchedCompanyKeys.add(cid);
+        if (parsed.length) {
+          fetchedCompanyKeys.add(cid);
+          failedCompanyKeys.delete(cid);
+        }
       } catch (error) {
-        failedCompanyKeys.add(cid);
+        if (!fetchedCompanyKeys.has(cid)) failedCompanyKeys.add(cid);
         if (failureSamples.length < 3) {
           const payloadText = decodeBase64Text(item.bodyBase64, item.contentType);
           failureSamples.push(`${company.bookmaker} ${type} 解析失败：${error.message}；内容：${summarizeText(payloadText) || item.preview || "空"}`);
@@ -2135,7 +2223,7 @@ function oddsClassByDelta(value) {
   return "";
 }
 
-function buildHeroMetrics(result) {
+function buildHeroMetrics(result, bettingAnalysis = null) {
   const bookmakers = result.bookmakers || [];
   const records = result.records || [];
   const hasData = records.length > 0;
@@ -2165,20 +2253,12 @@ function buildHeroMetrics(result) {
   const last = bookmakers[0]?.last;
   const probabilityValues = impliedProbabilities(last || first);
   const averageOdds = buildAverageOddsChange(bookmakers);
-  const oddsChange = first && last
-    ? averageFinite([
-      last.homeOdds - first.homeOdds,
-      last.drawOdds - first.drawOdds,
-      last.awayOdds - first.awayOdds,
-    ])
-    : null;
   const kellyIndex = averageFinite(bookmakers.map((bookmaker) => averageFinite([
     bookmaker.last?.kellyHome,
     bookmaker.last?.kellyDraw,
     bookmaker.last?.kellyAway,
   ])));
-  const oddsChangeImpact = Number.isFinite(oddsChange) ? Math.abs(oddsChange) : 0;
-  const heat = clamp(42 + records.length * 0.18 + bookmakers.length * 2.4 + oddsChangeImpact * 18, 18, 96);
+  const heatProfile = buildMarketHeatProfile(bettingAnalysis);
   const oddsTrend = records.slice(-18).map((record) => averageFinite([record.homeOdds, record.drawOdds, record.awayOdds]));
   const kellyTrend = records.slice(-18).map((record) => averageFinite([record.kellyHome, record.kellyDraw, record.kellyAway]));
 
@@ -2192,11 +2272,39 @@ function buildHeroMetrics(result) {
     averageOddsChange: averageOdds.items,
     averageOddsMeta: `${averageOdds.count} 家主流公司样本`,
     kellyIndex: Number.isFinite(kellyIndex) ? kellyIndex : null,
-    heat,
+    heat: heatProfile.heat,
     oddsTrend,
     kellyTrend,
-    heatTrend: buildSyntheticTrend(heat),
+    heatTrend: heatProfile.trend,
   };
+}
+
+function buildMarketHeatProfile(analysis) {
+  const volumeTotal = sumOutcomeAmounts(analysis?.volume);
+  const largeTotal = sumOutcomeAmounts(analysis?.largeVolume);
+  if (!volumeTotal && !largeTotal) return { heat: null, trend: [] };
+
+  const entries = getOutcomeAmountEntries(analysis?.volume);
+  const leader = entries[0];
+  const concentration = volumeTotal && leader ? leader.value / volumeTotal : 0;
+  const volumeScore = clamp(Math.log10(Math.max(volumeTotal, 1)) / 6 * 52, 0, 52);
+  const concentrationScore = clamp((concentration - 1 / 3) / (2 / 3) * 22, 0, 22);
+  const largeScore = clamp(Math.log10(Math.max(largeTotal, 1)) / 6 * 16, 0, 16);
+  const trendScore = clamp((analysis?.trend?.length || 0) / 12 * 10, 0, 10);
+  const heat = clamp(18 + volumeScore + concentrationScore + largeScore + trendScore, 8, 98);
+  const trend = buildHeatTrendFromBetting(analysis, heat);
+  return { heat, trend };
+}
+
+function buildHeatTrendFromBetting(analysis, fallbackHeat) {
+  const rows = (analysis?.trend || [])
+    .map((row) => sumOutcomeAmounts(row))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  if (rows.length >= 2) {
+    const max = Math.max(...rows, 1);
+    return rows.slice(-18).map((value) => clamp(18 + value / max * 78, 8, 98));
+  }
+  return Number.isFinite(fallbackHeat) ? buildSyntheticTrend(fallbackHeat) : [];
 }
 
 function buildAverageOddsChange(bookmakers) {

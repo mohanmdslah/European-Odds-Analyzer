@@ -174,6 +174,12 @@ function buildReferer(target, path, search) {
   if (fixtureId && /\/fenxi1\/(?:json\/)?touzhu\.php/i.test(path)) {
     return `${target}/fenxi/touzhu-${fixtureId}.shtml`;
   }
+  if (fixtureId && /\/fenxi1\/(?:json\/)?yazhi\.php/i.test(path)) {
+    return `${target}/fenxi/yazhi-${fixtureId}.shtml`;
+  }
+  if (fixtureId && /\/fenxi1\/(?:json\/)?daxiao\.php/i.test(path)) {
+    return `${target}/fenxi/daxiao-${fixtureId}.shtml`;
+  }
 
   return `${target}/`;
 }
